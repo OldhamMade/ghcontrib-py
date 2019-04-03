@@ -1,0 +1,144 @@
+#!/usr/bin/env python
+"""ghcontrib
+
+Calculates a user's contributions to a github-hosted project.
+
+Usage:
+  ghcontrib <user> <project> <repo> --token=<authtoken> [--exclude=<exclude>]
+  ghcontrib -h | --help
+  ghcontrib --version
+
+Options:
+  --exclude=<exclude>  Comma-separate list of PR numbers to exclude
+  -h --help            Show this help.
+  --version            Show version.
+"""
+
+import re
+
+import grequests
+from docopt import docopt
+
+
+RE_ARG_NAME = re.compile('(\w[\w\-_]+)')
+RE_LINK_LAST = re.compile('\<([^\>]+\D)(\d+)\>; rel="last"')
+GH_URL = 'https://api.github.com/repos/{project}/{repo}/pulls/{id}'
+
+
+def clean_args(args):
+    """Return a dict of docopt args with keys usable as kwargs."""
+    return {
+        RE_ARG_NAME.search(key).groups()[0].replace('-', '_'): val
+        for key, val in args.items()
+    }
+
+
+def fetch(project, repo, token, prs=None, pages=None):
+    if not prs:
+        prs = ['']
+
+    if not pages:
+        pages = 1
+
+    reqs = (
+        grequests.get(
+            GH_URL.format(project=project, repo=repo, id=id).rstrip("/"),
+            params={
+                'state': 'all',
+                'page': page,
+            },
+            headers={
+                'Authorization': 'token {}'.format(token)
+            }
+        )
+        for id
+        in prs
+        for page
+        in range(1, pages + 1)
+    )
+
+    return (resp for resp in grequests.map(reqs))
+
+
+def fetch_pr_list(project, repo, token):
+    result = next(iter(fetch(project, repo, token)))
+    links = result.headers["link"]
+
+    _url, last = RE_LINK_LAST.search(links).groups()
+
+    for result in fetch(project, repo, token, pages=int(last)):
+        for pr in result.json():
+            yield pr
+
+
+def filter_by_owner(prs, user):
+    for pr in prs:
+        if pr["user"]["login"].lower() == user.lower():
+            yield pr
+
+
+def filter_exclusions(prs, exclusions):
+    exclusions = set(int(i) for i in exclusions)
+
+    for pr in prs:
+        if int(pr["number"]) not in exclusions:
+            yield pr
+
+
+def fetch_pr_details(project, repo, token, prs):
+    return (
+        r.json()
+        for r
+        in fetch(project, repo, token, prs=(pr['number'] for pr in prs))
+    )
+
+
+def calculate_contribution(prs):
+    details = {
+        'commits': 0,
+        'additions': 0,
+        'deletions': 0,
+        'changed_files': 0,
+    }
+
+    for pr in prs:
+        for k in details.keys():
+            details[k] += pr[k]
+
+    return details
+
+
+def display_summary(user, project, repo, details):
+    print("""
+Contributions to {project}/{repo} by {user}:
+  Commits: {commits}
+  Changed files: {changed_files}
+  Additions: {additions}
+  Deletions: {deletions}
+    (Impact: {impact:+})
+     (Shift: ~{shift})
+    """.format(
+        user=user,
+        project=project,
+        repo=repo,
+        impact=details['additions'] - details['deletions'],
+        shift=details['additions'] + details['deletions'],
+        **details
+    ))
+
+
+def main(user, project, repo, token, exclude=None, **_):
+    exclude = exclude.split(",") if exclude else []
+
+    prs = fetch_pr_list(project, repo, token)
+    prs = filter_by_owner(prs, user)
+    prs = filter_exclusions(prs, exclude)
+    prs = fetch_pr_details(project, repo, token, prs)
+
+    details = calculate_contribution(prs)
+    display_summary(user, project, repo, details)
+
+
+if __name__ == '__main__':
+    arguments = docopt(__doc__, version='ghcontrib 1.0')
+    main(**clean_args(arguments))
